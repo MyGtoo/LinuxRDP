@@ -1,0 +1,133 @@
+name: Linux-RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Install Desktop Environment (Xfce4)
+        run: |
+          sudo apt update
+          sudo DEBIAN_FRONTEND=noninteractive apt install -y xfce4 xfce4-goodies
+          echo "xfce4-session" > ~/.xsession
+
+      - name: Install and Configure xRDP
+        run: |
+          # Install xRDP server
+          sudo apt install -y xrdp
+          
+          # Add xrdp user to ssl-cert group for certificate access
+          sudo adduser xrdp ssl-cert
+          
+          # Configure xRDP to use Xfce4
+          echo "xfce4-session" | sudo tee /etc/xrdp/startwm.sh
+          sudo chmod +x /etc/xrdp/startwm.sh
+          
+          # Restart xRDP service
+          sudo systemctl restart xrdp
+          sudo systemctl enable xrdp
+          
+          # Verify xRDP is running
+          sudo systemctl status xrdp
+
+      - name: Create RDP User with Secure Password
+        run: |
+          # Generate secure random password
+          password=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-16)
+          
+          # Create user (runner user already exists, so we'll set password)
+          echo "runner:$password" | sudo chpasswd
+          
+          # Add runner to necessary groups
+          sudo usermod -aG sudo runner
+          
+          # Store credentials in environment
+          echo "RDP_CREDS=User: runner | Password: $password" >> $GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $GITHUB_ENV
+          
+          # Verify user exists
+          id runner
+
+      - name: Configure Firewall
+        run: |
+          # Install UFW if not present
+          sudo apt install -y ufw
+          
+          # For testing, allow RDP port (in production, restrict to Tailscale IPs)
+          sudo ufw allow 3389/tcp
+          
+          # Enable firewall (with force to avoid prompt)
+          sudo ufw --force enable
+          
+          # Show firewall status
+          sudo ufw status
+
+      - name: Install Tailscale
+        run: |
+          # Install Tailscale using official script
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Start Tailscale with auth key
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-runner-${{ github.run_id }} \
+            --accept-routes
+          
+          # Wait for Tailscale to assign an IP
+          retries=0
+          while [ $retries -lt 10 ]; do
+            tsIP=$(tailscale ip -4 2>/dev/null)
+            if [ ! -z "$tsIP" ]; then
+              echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+              echo "Tailscale IP assigned: $tsIP"
+              break
+            fi
+            sleep 5
+            retries=$((retries + 1))
+          done
+          
+          if [ -z "$tsIP" ]; then
+            echo "Failed to get Tailscale IP"
+            exit 1
+          fi
+
+      - name: Verify RDP Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          
+          # Check if xRDP is listening on port 3389
+          if sudo netstat -tuln | grep :3389; then
+            echo "xRDP is listening on port 3389"
+          else
+            echo "xRDP is NOT listening on port 3389"
+            exit 1
+          fi
+          
+          # Check xRDP service status
+          sudo systemctl is-active xrdp || exit 1
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "=== RDP ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: runner"
+          echo "Password: $RDP_PASSWORD"
+          echo "==================="
+          echo ""
+          echo "Connect using any RDP client:"
+          echo "  - Windows: Remote Desktop Connection (mstsc)"
+          echo "  - macOS: Microsoft Remote Desktop"
+          echo "  - Linux: Remmina or xfreerdp"
+          echo ""
+          
+          # Keep runner active
+          while true; do
+            echo "[$(date)] RDP Active - Workflow will timeout in $((3600 - SECONDS/60)) minutes"
+            sleep 300
+          done
